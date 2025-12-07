@@ -1,118 +1,114 @@
 ###############################################
-# ALB Security Group
+# ALB Controller IAM (IRSA)
 ###############################################
-resource "aws_security_group" "alb_sg" {
-  name        = "${var.cluster_name}-alb-sg"
-  description = "Security group for ALB"
-  vpc_id      = module.vpc.vpc_id
 
-  ingress {
-    description = "Allow HTTP from internet"
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+data "aws_iam_policy_document" "alb_assume_role" {
+  statement {
+    actions = ["sts:AssumeRoleWithWebIdentity"]
 
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
+    principals {
+      type        = "Federated"
+      identifiers = [module.eks.oidc_provider_arn]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "${replace(module.eks.cluster_oidc_issuer_url, "https://", "")}:sub"
+      values   = ["system:serviceaccount:kube-system:aws-load-balancer-controller"]
+    }
   }
+}
+
+resource "aws_iam_role" "alb_controller" {
+  name               = "${var.cluster_name}-alb-controller"
+  assume_role_policy = data.aws_iam_policy_document.alb_assume_role.json
 
   tags = {
     Environment = var.environment
+    Project     = "hartree-eks"
   }
 }
 
-###############################################
-# Application Load Balancer
-###############################################
-resource "aws_lb" "app_alb" {
-  name               = "${var.cluster_name}-alb"
-  load_balancer_type = "application"
-  internal           = false
+resource "aws_iam_policy" "alb_controller" {
+  name   = "${var.cluster_name}-alb-controller"
+  policy = file("${path.module}/iam/aws-load-balancer-controller-policy.json")
+}
 
-  subnets         = module.vpc.public_subnets
-  security_groups = [aws_security_group.alb_sg.id]
+resource "aws_iam_role_policy_attachment" "alb_controller" {
+  role       = aws_iam_role.alb_controller.name
+  policy_arn = aws_iam_policy.alb_controller.arn
+}
 
-  tags = {
-    Environment = var.environment
+###############################################
+# K8s ServiceAccount (IRSA)
+###############################################
+
+provider "kubernetes" {
+  host                   = module.eks.cluster_endpoint
+  cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+  token                  = data.aws_eks_cluster_auth.this.token
+}
+
+data "aws_eks_cluster_auth" "this" {
+  name = module.eks.cluster_name
+}
+
+resource "kubernetes_service_account_v1" "alb_controller" {
+  metadata {
+    name      = "aws-load-balancer-controller"
+    namespace = "kube-system"
+    annotations = {
+      "eks.amazonaws.com/role-arn" = aws_iam_role.alb_controller.arn
+    }
+  }
+
+  depends_on = [
+    module.eks,
+    aws_iam_role_policy_attachment.alb_controller,
+  ]
+}
+
+###############################################
+# ALB Controller Helm release
+###############################################
+
+provider "helm" {
+  kubernetes {
+    host                   = module.eks.cluster_endpoint
+    cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+    token                  = data.aws_eks_cluster_auth.this.token
   }
 }
 
-###############################################
-# Allow ALB -> NodePort (30080)
-###############################################
-resource "aws_security_group_rule" "alb_to_nodes" {
-  description              = "Allow ALB to reach NodePort on worker nodes"
-  type                     = "ingress"
-  from_port                = 30080
-  to_port                  = 30080
-  protocol                 = "tcp"
-  security_group_id        = module.eks.node_security_group_id
-  source_security_group_id = aws_security_group.alb_sg.id
-}
+resource "helm_release" "aws_load_balancer_controller" {
+  name       = "aws-load-balancer-controller"
+  namespace  = "kube-system"
+  repository = "https://aws.github.io/eks-charts"
+  chart      = "aws-load-balancer-controller"
+  version    = "1.8.2"
 
-###############################################
-# Target Group
-###############################################
-resource "aws_lb_target_group" "app_tg" {
-  name        = "${var.cluster_name}-tg"
-  port        = 30080
-  protocol    = "HTTP"
-  vpc_id      = module.vpc.vpc_id
-  target_type = "instance"   # correct for NodePort
-
-  health_check {
-    path = "/"
+  set {
+    name  = "clusterName"
+    value = module.eks.cluster_name
   }
 
-  tags = {
-    Environment = var.environment
+  set {
+    name  = "region"
+    value = var.region
   }
-}
 
-###############################################
-# HTTP Listener
-###############################################
-resource "aws_lb_listener" "http" {
-  load_balancer_arn = aws_lb.app_alb.arn
-  port              = 80
-  protocol          = "HTTP"
-
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.app_tg.arn
+  set {
+    name  = "serviceAccount.create"
+    value = "false"
   }
+
+  set {
+    name  = "serviceAccount.name"
+    value = "aws-load-balancer-controller"
+  }
+
+  depends_on = [
+    module.eks,
+    kubernetes_service_account_v1.alb_controller,
+  ]
 }
-
-###############################################
-# Discover ALL ASGs (EKS creates them)
-###############################################
-data "aws_autoscaling_groups" "all" {}
-
-###############################################
-# Filter ASGs for our nodegroup "app"
-###############################################
-data "aws_autoscaling_group" "app_asgs" {
-  for_each = toset([
-    for name in data.aws_autoscaling_groups.all.names : name
-    if can(regex(".*app.*", name))   # matches nodegroup
-  ])
-
-  name = each.value
-}
-
-###############################################
-# Attach ASGs to Target Group
-###############################################
-resource "aws_autoscaling_attachment" "asg_attachment" {
-  for_each = data.aws_autoscaling_group.app_asgs
-
-  autoscaling_group_name = each.value.name
-  lb_target_group_arn   = aws_lb_target_group.app_tg.arn
-}
-
-

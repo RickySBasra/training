@@ -2,6 +2,10 @@ resource "aws_eks_access_entry" "admin_user" {
   cluster_name  = module.eks.cluster_name
   principal_arn = "arn:aws:iam::722847566444:user/tf-admin"
   type          = "STANDARD"
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_eks_access_policy_association" "admin_access" {
@@ -12,5 +16,8 @@ resource "aws_eks_access_policy_association" "admin_access" {
   access_scope {
     type = "cluster"
   }
-}
 
+  lifecycle {
+    prevent_destroy = true
+  }
+}

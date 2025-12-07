@@ -16,8 +16,3 @@ output "cluster_ca" {
 output "region" {
   value = var.region
 }
-
-output "alb_dns" {
-  value = aws_lb.app_alb.dns_name
-}
-

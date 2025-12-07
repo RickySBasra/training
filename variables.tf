@@ -5,18 +5,22 @@ variable "region" {
 }
 
 variable "environment" {
-  type        = string
-  default     = "dev"
+  type    = string
+  default = "dev"
 }
 
 variable "cluster_name" {
-  type        = string
-  default     = "hartree-eks-dev"
+  type    = string
+  default = "hartree-eks-dev"
 }
 
 variable "vpc_cidr" {
-  type        = string
-  default     = "10.0.0.0/16"
+  type    = string
+  default = "10.0.0.0/16"
 }
 
 
+variable "admin_principal_arn" {
+  description = "IAM ARN for tf-admin user"
+  type        = string
+}

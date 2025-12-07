@@ -1,0 +1,42 @@
+# === TERRAFORM ===
+.terraform/
+.terraform.lock.hcl
+
+# Local override files (never commit)
+terraform.tfvars
+*.tfvars
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Crash logs
+crash.log
+crash.*.log
+
+# Plan files
+*.tfplan
+*.tfstate
+*.tfstate.backup
+
+# === KUBERNETES ===
+# Generated manifests or artefacts
+k8s/*.yaml
+!k8s/*.tmpl
+
+# === EDITOR / OS FILES ===
+.DS_Store
+*.swp
+*.swo
+*.tmp
+
+# === ARGOCD ===
+# ArgoCD admin password file if ever exported
+argocd-password.txt
+
+# === PYTHON / SHELL / UTILS ===
+__pycache__/
+*.pyc
+
+# === MISC ===
+*.log
