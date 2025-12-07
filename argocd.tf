@@ -7,7 +7,6 @@ resource "helm_release" "argocd" {
   chart      = "argo-cd"
   version    = "6.7.12"
 
-  # Avoid CRD uninstall issues
   skip_crds = true
   timeout   = 600
 
@@ -15,6 +14,7 @@ resource "helm_release" "argocd" {
 
   depends_on = [
     module.eks,
+    time_sleep.wait_for_rbac,
     helm_release.aws_load_balancer_controller,
   ]
 }

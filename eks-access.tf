@@ -1,11 +1,7 @@
 resource "aws_eks_access_entry" "admin_user" {
   cluster_name  = module.eks.cluster_name
-  principal_arn = "arn:aws:iam::722847566444:user/tf-admin"
+  principal_arn = var.admin_principal_arn
   type          = "STANDARD"
-
-  lifecycle {
-    prevent_destroy = true
-  }
 }
 
 resource "aws_eks_access_policy_association" "admin_access" {
@@ -16,8 +12,14 @@ resource "aws_eks_access_policy_association" "admin_access" {
   access_scope {
     type = "cluster"
   }
+}
 
-  lifecycle {
-    prevent_destroy = true
-  }
+# Give AWS 60–90s to propagate access into the cluster before
+# Kubernetes/Helm try to connect.
+resource "time_sleep" "wait_for_rbac" {
+  depends_on = [
+    aws_eks_access_policy_association.admin_access,
+  ]
+
+  create_duration = "90s"
 }
