@@ -27,3 +27,8 @@ aws eks update-kubeconfig --name hartree-eks-dev --region eu-west-2
 kubectl get pods -n argocd
 
 kubectl get nodes
+kubectl get ns 
+
+kubectl -n kube-system get configmap aws-auth -o yaml
+
+https://<ARGOCD-LOADBALANCER-DNS> --> kubectl get svc -n argocd argocd-server
