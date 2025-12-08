@@ -104,12 +104,72 @@ delete_vpc_safely() {
   done
 
   # 6. Delete non-default security groups
-  echo "==> Deleting Security Groups..."
-  SGS=$(aws ec2 describe-security-groups --filters Name=vpc-id,Values=${VPC_ID} --query "SecurityGroups[?GroupName!='default'].GroupId" --output text 2>/dev/null || true)
+  echo "==> Cleaning up and deleting Security Groups..."
+
+  # Get all SG IDs except default
+  SGS=$(aws ec2 describe-security-groups \
+    --filters Name=vpc-id,Values=${VPC_ID} \
+    --query "SecurityGroups[?GroupName!='default'].GroupId" \
+    --output text || true)
+
   for sg in ${SGS}; do
+    echo "==> Cleaning rules for SG ${sg}"
+
+    # 1. Remove all ingress rules referencing other SGs
+    REF_SGS=$(aws ec2 describe-security-groups \
+      --group-ids ${sg} \
+      --query "SecurityGroups[].IpPermissions[].UserIdGroupPairs[].GroupId" \
+      --output text || true)
+
+    for ref in ${REF_SGS}; do
+      echo "  - Removing ingress rule referencing SG ${ref}"
+      aws ec2 revoke-security-group-ingress \
+        --group-id ${sg} \
+        --source-group ${ref} \
+        --protocol all 2>/dev/null || true
+    done
+
+    # 2. Remove all egress rules referencing other SGs
+    REF_EGRESS_SGS=$(aws ec2 describe-security-groups \
+      --group-ids ${sg} \
+      --query "SecurityGroups[].IpPermissionsEgress[].UserIdGroupPairs[].GroupId" \
+      --output text || true)
+
+    for ref in ${REF_EGRESS_SGS}; do
+      echo "  - Removing egress rule referencing SG ${ref}"
+      aws ec2 revoke-security-group-egress \
+        --group-id ${sg} \
+        --destination-group ${ref} \
+        --protocol all 2>/dev/null || true
+    done
+
+    # 3. Remove ALL remaining ingress rules (ports, CIDRs, etc.)
+    echo "  - Removing all remaining ingress rules"
+    aws ec2 describe-security-groups --group-ids ${sg} \
+      --query "SecurityGroups[].IpPermissions" \
+      --output json | \
+      jq -c '.[]' | while read perm; do
+        aws ec2 revoke-security-group-ingress \
+          --group-id ${sg} \
+          --ip-permissions "${perm}" 2>/dev/null || true
+      done
+
+    # 4. Remove ALL remaining egress rules
+    echo "  - Removing all remaining egress rules"
+    aws ec2 describe-security-groups --group-ids ${sg} \
+      --query "SecurityGroups[].IpPermissionsEgress" \
+      --output json | \
+      jq -c '.[]' | while read perm; do
+        aws ec2 revoke-security-group-egress \
+          --group-id ${sg} \
+          --ip-permissions "${perm}" 2>/dev/null || true
+      done
+
+    # 5. Try to delete the SG now
     echo "  - Deleting SG ${sg}"
     aws ec2 delete-security-group --group-id "${sg}" || true
   done
+
 
   # 7. Delete subnets
   echo "==> Deleting Subnets..."
@@ -240,15 +300,16 @@ fi
 if aws dynamodb describe-table --table-name "${TF_LOCK_TABLE}" >/dev/null 2>&1; then
   echo "  - Deleting DynamoDB lock table ${TF_LOCK_TABLE}"
   aws dynamodb delete-table --table-name "${TF_LOCK_TABLE}" || true
+
+else
+  echo "  - No DynamoDB lock table ${TF_LOCK_TABLE} found."
+fi
+
   aws dynamodb create-table \
   --table-name hartree-tfstate-locks \
   --attribute-definitions AttributeName=LockID,AttributeType=S \
   --key-schema AttributeName=LockID,KeyType=HASH \
   --billing-mode PAY_PER_REQUEST
-else
-  echo "  - No DynamoDB lock table ${TF_LOCK_TABLE} found."
-fi
-
 echo "============================================"
 echo "==> ALL DONE. EKS/VPC/IAM/state for ${CLUSTER_NAME} cleaned (best-effort)."
 echo "============================================"

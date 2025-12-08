@@ -22,4 +22,10 @@ spec:
       selfHeal: true
 EOF
   )
+
+  depends_on = [
+    helm_release.argocd,
+    module.eks,
+    time_sleep.wait_for_rbac,
+  ]
 }

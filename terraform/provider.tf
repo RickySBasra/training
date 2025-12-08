@@ -25,20 +25,17 @@ provider "aws" {
   region = var.region
 }
 
-# These data sources are the “bridge” between EKS + RBAC and the k8s/helm providers.
-# They depend on the RBAC wait in eks-access.tf
+# EKS metadata – waits for RBAC bootstrap
 data "aws_eks_cluster" "this" {
   name = module.eks.cluster_name
-
   depends_on = [
     module.eks,
-    time_sleep.wait_for_rbac, # defined in eks-access.tf
+    time_sleep.wait_for_rbac,
   ]
 }
 
 data "aws_eks_cluster_auth" "this" {
   name = module.eks.cluster_name
-
   depends_on = [
     module.eks,
     time_sleep.wait_for_rbac,
@@ -46,15 +43,15 @@ data "aws_eks_cluster_auth" "this" {
 }
 
 provider "kubernetes" {
-  host                   = data.aws_eks_cluster.this.endpoint
-  cluster_ca_certificate = base64decode(data.aws_eks_cluster.this.certificate_authority[0].data)
+  host                   = module.eks.cluster_endpoint
+  cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
   token                  = data.aws_eks_cluster_auth.this.token
 }
 
 provider "helm" {
   kubernetes {
-    host                   = data.aws_eks_cluster.this.endpoint
-    cluster_ca_certificate = base64decode(data.aws_eks_cluster.this.certificate_authority[0].data)
+    host                   = module.eks.cluster_endpoint
+    cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
     token                  = data.aws_eks_cluster_auth.this.token
   }
 }

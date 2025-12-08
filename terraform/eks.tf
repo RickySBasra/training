@@ -55,3 +55,32 @@ module "eks" {
 
   depends_on = [module.vpc]
 }
+
+# ---------------------------------------------------------
+# Ensure all security groups are destroy-safe
+# ---------------------------------------------------------
+resource "aws_security_group_rule" "allow_nodes_from_cluster" {
+  security_group_id        = module.eks.node_security_group_id
+  source_security_group_id = module.eks.cluster_security_group_id
+  protocol                 = "-1"
+  from_port                = 0
+  to_port                  = 0
+  type                     = "ingress"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_security_group_rule" "allow_cluster_from_nodes" {
+  security_group_id        = module.eks.cluster_security_group_id
+  source_security_group_id = module.eks.node_security_group_id
+  protocol                 = "-1"
+  from_port                = 0
+  to_port                  = 0
+  type                     = "ingress"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}

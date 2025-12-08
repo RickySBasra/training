@@ -35,3 +35,10 @@ https://<ARGOCD-LOADBALANCER-DNS> --> kubectl get svc -n argocd argocd-server
 
 kubectl get applications -n argocd
 kubectl logs deploy/argocd-repo-server -n argocd
+kubectl -n argocd get application guestbook -o yaml 
+
+kubectl -n kube-system rollout restart deployment aws-load-balancer-controller
+
+kubectl get ingress -n guestbook
+kubectl get pods -n guestbook
+kubectl -n kube-system logs deploy/aws-load-balancer-controller -f

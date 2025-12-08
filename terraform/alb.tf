@@ -27,54 +27,38 @@ resource "aws_iam_role" "alb_controller" {
 }
 
 ###############################################################
-# Download AWS LB Controller policy JSON (v2.7.1)
+# Official AWS LB Controller policy (v2.7.1) + extra describes
 ###############################################################
 
 data "http" "aws_lb_json" {
   url = "https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.7.1/docs/install/iam_policy.json"
 }
 
-###############################################################
-# Additional missing permissions (DescribeLoadBalancers, etc.)
-###############################################################
-
 locals {
-  alb_extra_json = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect   = "Allow"
-        Action   = [
-          "elasticloadbalancing:DescribeLoadBalancers",
-          "elasticloadbalancing:DescribeLoadBalancerAttributes"
-        ]
-        Resource = "*"
-      }
-    ]
+  alb_policy_json = jsonencode({
+    Version   = "2012-10-17"
+    Statement = concat(
+      jsondecode(data.http.aws_lb_json.response_body).Statement,
+      [
+        {
+          Effect   = "Allow"
+          Action   = [
+            "elasticloadbalancing:DescribeLoadBalancers",
+            "elasticloadbalancing:DescribeLoadBalancerAttributes"
+          ]
+          Resource = "*"
+        }
+      ]
+    )
   })
 }
 
-###############################################################
-# Combine JSON via native JSON merge at the policy resource
-###############################################################
-
 resource "aws_iam_policy" "alb_controller" {
-  name = "${var.cluster_name}-alb-controller-policy"
-
-  # Merge upstream JSON + custom JSON
-  policy = jsonencode(
-    merge(
-      jsondecode(data.http.aws_lb_json.response_body),
-      jsondecode(local.alb_extra_json)
-    )
-  )
+  name   = "${var.cluster_name}-alb-controller-policy"
+  policy = local.alb_policy_json
 }
 
-###############################################################
-# Attach the final IAM policy to the IAM role
-###############################################################
-
-resource "aws_iam_role_policy_attachment" "alb_controller" {
+resource "aws_iam_role_policy_attachment" "alb_controller_attach" {
   role       = aws_iam_role.alb_controller.name
   policy_arn = aws_iam_policy.alb_controller.arn
 }
@@ -90,7 +74,7 @@ resource "helm_release" "aws_load_balancer_controller" {
 
   repository = "https://aws.github.io/eks-charts"
   chart      = "aws-load-balancer-controller"
-  version    = "1.7.1"  # latest matching controller 2.7.1
+  version    = "1.7.1"
 
   values = [
     yamlencode({
@@ -109,7 +93,8 @@ resource "helm_release" "aws_load_balancer_controller" {
   ]
 
   depends_on = [
-    aws_iam_role_policy_attachment.alb_controller,
-    module.eks,   # ensure cluster exists
+    module.eks,
+    time_sleep.wait_for_rbac,
+    aws_iam_role_policy_attachment.alb_controller_attach,
   ]
 }
