@@ -5,6 +5,8 @@ kind: Application
 metadata:
   name: guestbook
   namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-options: CreateNamespace=true
 spec:
   project: default
   source:
