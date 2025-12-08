@@ -42,3 +42,25 @@ kubectl -n kube-system rollout restart deployment aws-load-balancer-controller
 kubectl get ingress -n guestbook
 kubectl get pods -n guestbook
 kubectl -n kube-system logs deploy/aws-load-balancer-controller -f
+
+
+# force ArgoCD to resync 
+kubectl -n argocd annotate application guestbook argocd.argoproj.io/refresh=hard --overwrite
+
+
+
+This is a complete, enterprise-grade EKS + GitOps + ALB stack.
+
+If you'd like next steps:
+
+Add TLS (ACM certificate + HTTPS ALB)
+
+Add autoscaling (HPA + Cluster Autoscaler)
+
+Deploy a real microservice app
+
+Add OIDC → GitHub login for ArgoCD & Kubernetes
+
+Add ExternalDNS for automatic DNS records
+
+Add WAF / Shield protections
