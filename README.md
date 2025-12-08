@@ -32,3 +32,6 @@ kubectl get ns
 kubectl -n kube-system get configmap aws-auth -o yaml
 
 https://<ARGOCD-LOADBALANCER-DNS> --> kubectl get svc -n argocd argocd-server
+
+kubectl get applications -n argocd
+kubectl logs deploy/argocd-repo-server -n argocd
