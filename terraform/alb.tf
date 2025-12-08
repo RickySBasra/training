@@ -26,16 +26,62 @@ resource "aws_iam_role" "alb_controller" {
   assume_role_policy = data.aws_iam_policy_document.alb_assume_role.json
 }
 
-resource "aws_iam_role_policy_attachment" "alb_controller" {
-  role       = aws_iam_role.alb_controller.name
-  policy_arn = "arn:aws:iam::aws:policy/ElasticLoadBalancingFullAccess"
+###############################################################
+# Download AWS LB Controller policy JSON (v2.7.1)
+###############################################################
+
+data "http" "aws_lb_json" {
+  url = "https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.7.1/docs/install/iam_policy.json"
 }
 
+###############################################################
+# Additional missing permissions (DescribeLoadBalancers, etc.)
+###############################################################
 
+locals {
+  alb_extra_json = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = [
+          "elasticloadbalancing:DescribeLoadBalancers",
+          "elasticloadbalancing:DescribeLoadBalancerAttributes"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
 
-###############################################
-# ALB Controller Helm release
-###############################################
+###############################################################
+# Combine JSON via native JSON merge at the policy resource
+###############################################################
+
+resource "aws_iam_policy" "alb_controller" {
+  name = "${var.cluster_name}-alb-controller-policy"
+
+  # Merge upstream JSON + custom JSON
+  policy = jsonencode(
+    merge(
+      jsondecode(data.http.aws_lb_json.response_body),
+      jsondecode(local.alb_extra_json)
+    )
+  )
+}
+
+###############################################################
+# Attach the final IAM policy to the IAM role
+###############################################################
+
+resource "aws_iam_role_policy_attachment" "alb_controller" {
+  role       = aws_iam_role.alb_controller.name
+  policy_arn = aws_iam_policy.alb_controller.arn
+}
+
+###############################################################
+# AWS Load Balancer Controller Helm Chart
+###############################################################
 
 resource "helm_release" "aws_load_balancer_controller" {
   name             = "aws-load-balancer-controller"
@@ -44,7 +90,7 @@ resource "helm_release" "aws_load_balancer_controller" {
 
   repository = "https://aws.github.io/eks-charts"
   chart      = "aws-load-balancer-controller"
-  timeout    = 600
+  version    = "1.7.1"  # latest matching controller 2.7.1
 
   values = [
     yamlencode({
@@ -59,16 +105,11 @@ resource "helm_release" "aws_load_balancer_controller" {
           "eks.amazonaws.com/role-arn" = aws_iam_role.alb_controller.arn
         }
       }
-
-      ingressClassParams = {
-        create = false
-      }
     })
   ]
 
   depends_on = [
-    module.eks,
     aws_iam_role_policy_attachment.alb_controller,
-    time_sleep.wait_for_rbac,
+    module.eks,   # ensure cluster exists
   ]
 }

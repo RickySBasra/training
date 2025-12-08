@@ -14,7 +14,7 @@ resource "helm_release" "argocd" {
 
   depends_on = [
     module.eks,
-    time_sleep.wait_for_rbac,
-    helm_release.aws_load_balancer_controller,
+    time_sleep.wait_for_rbac
+    # helm_release.aws_load_balancer_controller,
   ]
 }
