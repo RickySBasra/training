@@ -69,6 +69,7 @@ resource "aws_security_group_rule" "allow_nodes_from_cluster" {
 
   lifecycle {
     create_before_destroy = true
+    ignore_changes = all
   }
 }
 
@@ -82,5 +83,6 @@ resource "aws_security_group_rule" "allow_cluster_from_nodes" {
 
   lifecycle {
     create_before_destroy = true
+    ignore_changes = all
   }
 }

@@ -43,11 +43,35 @@ kubectl get ingress -n guestbook
 kubectl get pods -n guestbook
 kubectl -n kube-system logs deploy/aws-load-balancer-controller -f
 
+ricky@RICKY-LAPTOP:~/git/training/terraform-gitops$ kubectl get application guestbook -n argocd
+NAME        SYNC STATUS   HEALTH STATUS
+guestbook   Synced        Healthy
+ricky@RICKY-LAPTOP:~/git/training/terraform-gitops$ kubectl get hpa -n guestbook
+NAME        REFERENCE              TARGETS              MINPODS   MAXPODS   REPLICAS   AGE
+guestbook   Deployment/guestbook   cpu: <unknown>/60%   2         5         0          9s
+
+ricky@RICKY-LAPTOP:~/git/training/terraform-gitops$ kubectl -n argocd describe application guestbook | grep -i hpa -n
+134:      Message:  the HPA controller was able to get the target's current scale
+
+# Check Cluster Autoscaler is running
+kubectl get deploy -n kube-system | grep autoscaler
 
 # force ArgoCD to resync 
 kubectl -n argocd annotate application guestbook argocd.argoproj.io/refresh=hard --overwrite
 
+# Logs
+kubectl -n kube-system logs deploy/cluster-autoscaler-aws-cluster-autoscaler -f
 
+# Can't delete VPC
+aws ec2 describe-network-interfaces \
+  --filters "Name=vpc-id,Values=vpc-071b1f88c67c8c6e9" \
+  --query 'NetworkInterfaces[*].{ID:NetworkInterfaceId,Desc:Description,Status:Status}'
+
+
+# Delete process
+kubectl delete ingress -A
+then destroy from terraform-gitops
+then terraform
 
 This is a complete, enterprise-grade EKS + GitOps + ALB stack.
 
