@@ -76,7 +76,7 @@ resource "helm_release" "aws_load_balancer_controller" {
 
   repository = "https://aws.github.io/eks-charts"
   chart      = "aws-load-balancer-controller"
-  version    = "1.7.1"
+  version    = "1.6.2" # ← USE THIS
 
   values = [
     yamlencode({
