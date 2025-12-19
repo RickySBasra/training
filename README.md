@@ -180,6 +180,31 @@ aws ec2 describe-network-interfaces \
   --query 'NetworkInterfaces[*].{ID:NetworkInterfaceId,Desc:Description,Status:Status}'
 
 
+The correct sequence (apply)
+
+The intended flow is:
+
+terraform/ – bring up network + EKS
+
+terraform-gitops/ – install platform add-ons + ArgoCD
+
+ArgoCD syncs gitops/ – deploy apps
+
+The correct sequence (destroy)
+
+This is the safest and what your README points to:
+
+Delete ingresses (and other LB-creating k8s resources if any)
+
+minimum: kubectl delete ingress -A
+
+Destroy terraform-gitops/ (removes ArgoCD + controllers)
+
+Destroy terraform/ (removes EKS + VPC)
+
+That exact order is written in your README. 
+GitHub
+
 # Delete process
 kubectl delete ingress -A
 then destroy from terraform-gitops
@@ -200,3 +225,78 @@ Add WAF / Shield protections
 
 
 
+ricky@RICKY-LAPTOP:~/git/training/terraform$ aws eks describe-cluster --name hartree-eks-dev --region eu-west-2 \
+  --query "cluster.resourcesVpcConfig.{endpointPublicAccess:endpointPublicAccess,endpointPrivateAccess:endpointPrivateAccess,publicAccessCidrs:publicAccessCidrs}" \
+  --output table
+---------------------------------------------------
+|                 DescribeCluster                 |
++------------------------+------------------------+
+|  endpointPrivateAccess | endpointPublicAccess   |
++------------------------+------------------------+
+|  True                  |  True                  |
++------------------------+------------------------+
+||               publicAccessCidrs               ||
+|+-----------------------------------------------+|
+||  0.0.0.0/0                                    ||
+|+-----------------------------------------------+|
+
+
+############ Deploy
+0) Prereqs (once per shell)
+cd ~/git/training
+
+aws sts get-caller-identity
+aws configure list
+
+1) Hard reset Terraform state + providers (recommended when you’ve destroyed/recreated)
+
+Do this in both terraform layers.
+
+Infra layer
+cd terraform
+rm -rf .terraform .terraform.lock.hcl
+terraform init -reconfigure
+terraform fmt -recursive
+terraform validate
+
+2) Deploy infrastructure (EKS/VPC/nodegroups/etc.)
+terraform apply -auto-approve
+
+3) Verify the EKS endpoint you’ll be talking to (sanity check)
+aws eks describe-cluster --name hartree-eks-dev --region eu-west-2 --query "cluster.endpoint" --output text
+
+4) Update kubeconfig (for your own kubectl/helm use; Terraform doesn’t need this)
+aws eks update-kubeconfig --name hartree-eks-dev --region eu-west-2
+kubectl get nodes
+
+5) Deploy platform add-ons / Argo bootstrap layer (if you’re using terraform-gitops/)
+cd ../terraform-gitops
+rm -rf .terraform .terraform.lock.hcl
+terraform init -reconfigure
+terraform fmt -recursive
+terraform validate
+terraform apply -auto-approve
+
+6) Confirm ArgoCD is up
+kubectl -n argocd get pods
+kubectl -n argocd get svc
+
+7) Sync apps (if your repo auto-syncs, this may happen automatically)
+
+If you’re applying Argo “apps-of-apps” from the gitops/ folder, you can validate:
+
+kubectl get applications -n argocd
+kubectl get pods -A
+
+Quick “clean deploy” checklist
+
+Run these and you’re in a known-good state:
+
+kubectl get nodes
+kubectl -n kube-system get pods
+kubectl -n argocd get pods
+kubectl get ingress -A
+kubectl get svc -A | grep LoadBalancer || true
+
+
+If you want, I can also give you the mirrored clean destroy sequence (apps → gitops TF → infra TF) in the same style.

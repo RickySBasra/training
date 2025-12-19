@@ -82,10 +82,10 @@ resource "helm_release" "cluster_autoscaler" {
         }
       }
       extraArgs = {
-        "balance-similar-node-groups"      = "true"
-        "skip-nodes-with-local-storage"    = "false"
-        "skip-nodes-with-system-pods"      = "false"
-        "scan-interval"                    = "10s"
+        "balance-similar-node-groups"   = "true"
+        "skip-nodes-with-local-storage" = "false"
+        "skip-nodes-with-system-pods"   = "false"
+        "scan-interval"                 = "10s"
       }
     })
   ]

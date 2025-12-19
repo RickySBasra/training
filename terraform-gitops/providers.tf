@@ -22,9 +22,9 @@ data "terraform_remote_state" "infra" {
   backend = "s3"
 
   config = {
-    bucket = var.infra_state_bucket          # NEW
-    key    = var.infra_state_key             # NEW
-    region = var.infra_state_bucket_region   # NEW
+    bucket = var.infra_state_bucket        # NEW
+    key    = var.infra_state_key           # NEW
+    region = var.infra_state_bucket_region # NEW
   }
 }
 

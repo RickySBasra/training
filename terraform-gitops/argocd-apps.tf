@@ -24,6 +24,6 @@ EOF
   )
 
   depends_on = [
-    data.terraform_remote_state.infra,  # ensures cluster + argocd exist
+    data.terraform_remote_state.infra, # ensures cluster + argocd exist
   ]
 }

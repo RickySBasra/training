@@ -14,8 +14,8 @@ module "eks" {
   enable_irsa = true
 
   cluster_addons = {
-    vpc-cni = { most_recent = true }
-    coredns = { most_recent = true }
+    vpc-cni    = { most_recent = true }
+    coredns    = { most_recent = true }
     kube-proxy = { most_recent = true }
   }
 
@@ -69,7 +69,7 @@ resource "aws_security_group_rule" "allow_nodes_from_cluster" {
 
   lifecycle {
     create_before_destroy = true
-    ignore_changes = all
+    ignore_changes        = all
   }
 }
 
@@ -83,6 +83,6 @@ resource "aws_security_group_rule" "allow_cluster_from_nodes" {
 
   lifecycle {
     create_before_destroy = true
-    ignore_changes = all
+    ignore_changes        = all
   }
 }
