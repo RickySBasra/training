@@ -6,17 +6,26 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+
     kubernetes = {
       source  = "hashicorp/kubernetes"
       version = "~> 2.29"
     }
+
     helm = {
       source  = "hashicorp/helm"
       version = "~> 2.10"
     }
+
     time = {
       source  = "hashicorp/time"
       version = "~> 0.11"
+    }
+
+    # ✅ Add correct kubectl provider (NOT hashicorp/kubectl)
+    kubectl = {
+      source  = "gavinbunney/kubectl"
+      version = ">= 1.14.0"
     }
   }
 }
