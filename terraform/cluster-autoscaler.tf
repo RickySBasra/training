@@ -36,11 +36,17 @@ data "aws_iam_policy_document" "cluster_autoscaler" {
       "autoscaling:SetDesiredCapacity",
       "autoscaling:TerminateInstanceInAutoScalingGroup",
       "autoscaling:UpdateAutoScalingGroup",
-      "ec2:DescribeLaunchTemplateVersions"
+      "ec2:DescribeLaunchTemplateVersions",
+
+      # ✅ add these for EKS managed nodegroups
+      "eks:DescribeNodegroup",
+      "eks:ListNodegroups",
+      "eks:DescribeCluster"
     ]
     resources = ["*"]
   }
 }
+
 
 resource "aws_iam_policy" "cluster_autoscaler" {
   name   = "${var.cluster_name}-cluster-autoscaler-policy"

@@ -300,3 +300,19 @@ kubectl get svc -A | grep LoadBalancer || true
 
 
 If you want, I can also give you the mirrored clean destroy sequence (apps → gitops TF → infra TF) in the same style.
+
+Test Autoscaler
+
+See config
+for ng in $(aws eks list-nodegroups --cluster-name hartree-eks-dev --region eu-west-2 --query "nodegroups[]" --output text); do
+  echo "Nodegroup: $ng"
+  aws eks describe-nodegroup \
+    --cluster-name hartree-eks-dev \
+    --nodegroup-name "$ng" \
+    --region eu-west-2 \
+    --query "nodegroup.scalingConfig" \
+    --output table
+done
+
+
+kubectl create ns scale-test 2>/dev/null || true; kubectl -n scale-test create deployment pause --image=public.ecr.aws/eks-distro/kubernetes/pause:3.2 2>/dev/null || true; kubectl -n scale-test scale deployment pause --replicas=20; kubectl -n scale-test patch deployment pause -p '{"spec":{"template":{"spec":{"containers":[{"name":"pause","resources":{"requests":{"cpu":"500m","memory":"256Mi"}}}]}}}}'; kubectl get nodes -w
