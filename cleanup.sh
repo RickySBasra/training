@@ -1,315 +1,371 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# hartree-destroy-merged.sh
+#
+# Re-runnable “belt & braces” destroy/cleanup script.
+# Goal: cleanly delete Kubernetes resources that create AWS infra,
+# then destroy TF layers (gitops → infra), then optionally do best-effort
+# post-clean of leftovers (LBs/TGs/EBS/OIDC) WITHOUT bombing out.
+#
+# ✅ Safe defaults:
+#  - DOES NOT delete arbitrary VPCs/IAM roles/policies/state by default
+#  - Only deletes OIDC providers if unused (safe mode)
+#  - AWS cleanup steps are best-effort and time-bounded
+#
+# Usage:
+#   ./hartree-destroy-merged.sh
+#
+# Common overrides:
+#   CLUSTER_NAME=hartree-eks-dev REGION=eu-west-2 \
+#   TF_INFRA_DIR=~/git/training/terraform TF_GITOPS_DIR=~/git/training/terraform-gitops \
+#   ./hartree-destroy-merged.sh
+#
+# Dry run:
+#   DRY_RUN=true ./hartree-destroy-merged.sh
+#
+# Optional toggles:
+#   CLEAN_AWS_LBS=true         # delete all ELBv2 LBs in region (default false)
+#   CLEAN_AWS_TGS=true         # delete all target groups in region (default false)
+#   CLEAN_EBS_AVAILABLE=true   # delete AVAILABLE volumes in region (default false)
+#   CLEAN_OIDC_UNUSED=true     # delete unused OIDC providers (default true)
+#   CLEAN_HELM_LBC=true        # uninstall aws-load-balancer-controller helm release (default true)
+#   DELETE_LBC_CRDS=true       # delete LBC CRDs after uninstall (default true)
+#
+set -Eeuo pipefail
 
 ########################################
-# CONFIG – EDIT THESE FOR YOUR ACCOUNT #
+# Config
 ########################################
-REGION="eu-west-2"
-ACCOUNT_ID="722847566444"
+CLUSTER_NAME="${CLUSTER_NAME:-hartree-eks-dev}"
+REGION="${REGION:-eu-west-2}"
 
-CLUSTER_NAME="hartree-eks-dev"
-PROJECT_TAG="hartree-eks"
-ENV_TAG="dev"
+TF_INFRA_DIR="${TF_INFRA_DIR:-$(pwd)/terraform}"
+TF_GITOPS_DIR="${TF_GITOPS_DIR:-$(pwd)/terraform-gitops}"
 
-# Remote Terraform state (if you used S3/Dynamo backend)
-TFSTATE_BUCKET="hartree-tfstate"        # S3 bucket for state
-TFSTATE_KEY_PREFIX="eks/dev"            # key prefix/folder
-TF_LOCK_TABLE="hartree-tfstate-locks"         # DynamoDB lock table (dedicated to TF)
+WAIT_POLL_SECS="${WAIT_POLL_SECS:-15}"
+WAIT_LB_TIMEOUT_SECS="${WAIT_LB_TIMEOUT_SECS:-900}"      # 15 min
+WAIT_K8S_TIMEOUT_SECS="${WAIT_K8S_TIMEOUT_SECS:-600}"    # 10 min
+
+DRY_RUN="${DRY_RUN:-false}"
+
+# Optional “extra” cleanup toggles (off by default except OIDC safe clean)
+CLEAN_AWS_LBS="${CLEAN_AWS_LBS:-false}"
+CLEAN_AWS_TGS="${CLEAN_AWS_TGS:-false}"
+CLEAN_EBS_AVAILABLE="${CLEAN_EBS_AVAILABLE:-false}"
+
+CLEAN_OIDC_UNUSED="${CLEAN_OIDC_UNUSED:-true}"
+
+CLEAN_HELM_LBC="${CLEAN_HELM_LBC:-true}"
+DELETE_LBC_CRDS="${DELETE_LBC_CRDS:-true}"
 
 ########################################
-echo "Using region: ${REGION}"
-aws configure set region "${REGION}"
+# Helpers
+########################################
+log() { printf "\n[%s] %s\n" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$*"; }
 
-############################
-# Helper: delete VPC stack #
-############################
-delete_vpc_safely() {
-  local VPC_ID="$1"
-  echo "============================================"
-  echo "==> Deep-cleaning VPC ${VPC_ID}"
-  echo "============================================"
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-  # 0. Delete ELBv2 load balancers in this VPC
-  echo "==> Deleting load balancers in VPC..."
-  LBS=$(aws elbv2 describe-load-balancers --query "LoadBalancers[?VpcId=='${VPC_ID}'].LoadBalancerArn" --output text 2>/dev/null || true)
-  for lb in ${LBS}; do
-    echo "  - Deleting LB: ${lb}"
-    aws elbv2 delete-load-balancer --load-balancer-arn "${lb}" || true
-  done
-  sleep 5
-
-  # 1. Delete NAT Gateways
-  echo "==> Deleting NAT Gateways..."
-  NGWS=$(aws ec2 describe-nat-gateways --filter Name=vpc-id,Values=${VPC_ID} --query "NatGateways[].NatGatewayId" --output text 2>/dev/null || true)
-  for ng in ${NGWS}; do
-    echo "  - Deleting NATGW ${ng}"
-    aws ec2 delete-nat-gateway --nat-gateway-id "${ng}" || true
-  done
-
-  echo "==> Waiting for NAT gateways to disappear..."
-  while true; do
-    STATES=$(aws ec2 describe-nat-gateways \
-      --filter Name=vpc-id,Values=${VPC_ID} \
-      --query "NatGateways[].State" \
-      --output text 2>/dev/null || true)
-
-    [[ -z "${STATES}" ]] && break
-
-    if ! [[ "${STATES}" =~ "pending" || "${STATES}" =~ "available" || "${STATES}" =~ "deleting" ]]; then
-      break
-    fi
-
-    echo "    NAT gateway states: ${STATES} ... waiting 10s"
-    sleep 10
-  done
-
-  # 2. Release EIPs
-  echo "==> Releasing EIPs..."
-  EIPS=$(aws ec2 describe-addresses --filters Name=domain,Values=vpc --query "Addresses[].AllocationId" --output text 2>/dev/null || true)
-  for eip in ${EIPS}; do
-    echo "  - Releasing EIP ${eip}"
-    aws ec2 release-address --allocation-id "${eip}" || true
-  done
-
-  # 3. Delete ENIs
-  echo "==> Deleting ENIs..."
-  ENIS=$(aws ec2 describe-network-interfaces --filters Name=vpc-id,Values=${VPC_ID} --query "NetworkInterfaces[].NetworkInterfaceId" --output text 2>/dev/null || true)
-  for eni in ${ENIS}; do
-    echo "  - Deleting ENI ${eni}"
-    aws ec2 delete-network-interface --network-interface-id "${eni}" || true
-  done
-  sleep 3
-
-  # 4. Detach & delete IGWs
-  echo "==> Deleting Internet Gateways..."
-  IGWS=$(aws ec2 describe-internet-gateways \
-    --filters Name=attachment.vpc-id,Values=${VPC_ID} \
-    --query "InternetGateways[].InternetGatewayId" --output text 2>/dev/null || true)
-  for igw in ${IGWS}; do
-    echo "  - Detaching IGW ${igw}"
-    aws ec2 detach-internet-gateway --internet-gateway-id "${igw}" --vpc-id "${VPC_ID}" || true
-    echo "  - Deleting IGW ${igw}"
-    aws ec2 delete-internet-gateway --internet-gateway-id "${igw}" || true
-  done
-
-  # 5. Delete non-main route tables
-  echo "==> Deleting Route Tables..."
-  RTBS=$(aws ec2 describe-route-tables --filters Name=vpc-id,Values=${VPC_ID} --query "RouteTables[].RouteTableId" --output text 2>/dev/null || true)
-  for rtb in ${RTBS}; do
-    MAIN=$(aws ec2 describe-route-tables --route-table-ids "${rtb}" --query "RouteTables[0].Associations[?Main].Main" --output text 2>/dev/null || true)
-    if [[ "${MAIN}" != "True" ]]; then
-      echo "  - Deleting RTB ${rtb}"
-      aws ec2 delete-route-table --route-table-id "${rtb}" || true
+need_cmds() {
+  local missing=0
+  for c in "$@"; do
+    if ! have_cmd "$c"; then
+      echo "❌ Missing required command: $c"
+      missing=1
     fi
   done
-
-  # 6. Delete non-default security groups
-  echo "==> Cleaning up and deleting Security Groups..."
-
-  # Get all SG IDs except default
-  SGS=$(aws ec2 describe-security-groups \
-    --filters Name=vpc-id,Values=${VPC_ID} \
-    --query "SecurityGroups[?GroupName!='default'].GroupId" \
-    --output text || true)
-
-  for sg in ${SGS}; do
-    echo "==> Cleaning rules for SG ${sg}"
-
-    # 1. Remove all ingress rules referencing other SGs
-    REF_SGS=$(aws ec2 describe-security-groups \
-      --group-ids ${sg} \
-      --query "SecurityGroups[].IpPermissions[].UserIdGroupPairs[].GroupId" \
-      --output text || true)
-
-    for ref in ${REF_SGS}; do
-      echo "  - Removing ingress rule referencing SG ${ref}"
-      aws ec2 revoke-security-group-ingress \
-        --group-id ${sg} \
-        --source-group ${ref} \
-        --protocol all 2>/dev/null || true
-    done
-
-    # 2. Remove all egress rules referencing other SGs
-    REF_EGRESS_SGS=$(aws ec2 describe-security-groups \
-      --group-ids ${sg} \
-      --query "SecurityGroups[].IpPermissionsEgress[].UserIdGroupPairs[].GroupId" \
-      --output text || true)
-
-    for ref in ${REF_EGRESS_SGS}; do
-      echo "  - Removing egress rule referencing SG ${ref}"
-      aws ec2 revoke-security-group-egress \
-        --group-id ${sg} \
-        --destination-group ${ref} \
-        --protocol all 2>/dev/null || true
-    done
-
-    # 3. Remove ALL remaining ingress rules (ports, CIDRs, etc.)
-    echo "  - Removing all remaining ingress rules"
-    aws ec2 describe-security-groups --group-ids ${sg} \
-      --query "SecurityGroups[].IpPermissions" \
-      --output json | \
-      jq -c '.[]' | while read perm; do
-        aws ec2 revoke-security-group-ingress \
-          --group-id ${sg} \
-          --ip-permissions "${perm}" 2>/dev/null || true
-      done
-
-    # 4. Remove ALL remaining egress rules
-    echo "  - Removing all remaining egress rules"
-    aws ec2 describe-security-groups --group-ids ${sg} \
-      --query "SecurityGroups[].IpPermissionsEgress" \
-      --output json | \
-      jq -c '.[]' | while read perm; do
-        aws ec2 revoke-security-group-egress \
-          --group-id ${sg} \
-          --ip-permissions "${perm}" 2>/dev/null || true
-      done
-
-    # 5. Try to delete the SG now
-    echo "  - Deleting SG ${sg}"
-    aws ec2 delete-security-group --group-id "${sg}" || true
-  done
-
-
-  # 7. Delete subnets
-  echo "==> Deleting Subnets..."
-  SUBNETS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=${VPC_ID}" --query "Subnets[].SubnetId" --output text 2>/dev/null || true)
-  for sn in ${SUBNETS}; do
-    echo "  - Deleting Subnet ${sn}"
-    aws ec2 delete-subnet --subnet-id "${sn}" || true
-  done
-
-  # 8. Delete VPC
-  echo "==> Attempting VPC deletion..."
-  aws ec2 delete-vpc --vpc-id "${VPC_ID}" || {
-    echo "❌ VPC deletion failed for ${VPC_ID} — dependencies may still exist."
-  }
-
-  echo "==> VPC deletion attempted for ${VPC_ID}"
+  if [[ "$missing" -eq 1 ]]; then
+    exit 1
+  fi
 }
 
-############################
-# 1. Delete EKS nodegroups #
-############################
-echo "==> Deleting EKS nodegroups for ${CLUSTER_NAME}..."
-NGS=$(aws eks list-nodegroups --cluster-name "${CLUSTER_NAME}" --query "nodegroups[]" --output text 2>/dev/null || true)
+run() {
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "DRY_RUN> $*"
+    return 0
+  fi
+  # Never bomb out for “best-effort” actions; caller decides strictness
+  eval "$@"
+}
 
-if [[ -n "${NGS}" ]]; then
-  for ng in ${NGS}; do
-    echo "  - Deleting nodegroup: ${ng}"
-    aws eks delete-nodegroup --cluster-name "${CLUSTER_NAME}" --nodegroup-name "${ng}" || true
-  done
+best_effort() {
+  set +e
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "DRY_RUN> $*"
+    set -e
+    return 0
+  fi
+  eval "$@"
+  local rc=$?
+  set -e
+  return $rc
+}
 
-  echo "==> Waiting for nodegroups to disappear..."
+wait_for_condition() {
+  # wait_for_condition <timeout> <poll> <desc> <test-cmd>
+  local timeout="$1"; shift
+  local poll="$1"; shift
+  local desc="$1"; shift
+  local start now
+  start="$(date +%s)"
   while true; do
-    REMAINING=$(aws eks list-nodegroups --cluster-name "${CLUSTER_NAME}" --query "nodegroups[]" --output text 2>/dev/null || true)
-    [[ -z "${REMAINING}" ]] && break
-    echo "  - Still present: ${REMAINING} ... sleeping 15s"
-    sleep 15
+    if eval "$@" >/dev/null 2>&1; then
+      log "✅ $desc"
+      return 0
+    fi
+    now="$(date +%s)"
+    if (( now - start > timeout )); then
+      log "⚠️ Timed out waiting for: $desc"
+      return 1
+    fi
+    log "⏳ Waiting for: $desc"
+    sleep "$poll"
   done
-else
-  echo "  - No nodegroups found."
-fi
+}
 
-##########################
-# 2. Delete EKS cluster  #
-##########################
-echo "==> Deleting EKS cluster ${CLUSTER_NAME} (if exists)..."
-if aws eks describe-cluster --name "${CLUSTER_NAME}" >/dev/null 2>&1; then
-  aws eks delete-cluster --name "${CLUSTER_NAME}"
-  echo "==> Waiting for cluster deletion..."
-  while aws eks describe-cluster --name "${CLUSTER_NAME}" >/dev/null 2>&1; do
-    echo "  - Cluster still exists, sleeping 15s"
-    sleep 15
+ns_exists() { kubectl get ns "$1" >/dev/null 2>&1; }
+
+ensure_kubeconfig() {
+  # Safe to run even if cluster is gone
+  if ! have_cmd aws; then
+    log "aws cli not found; skipping kubeconfig update."
+    return 0
+  fi
+
+  log "Ensuring kubeconfig is set for cluster '$CLUSTER_NAME' in region '$REGION' (best-effort)."
+  best_effort "aws eks update-kubeconfig --name \"$CLUSTER_NAME\" --region \"$REGION\" >/dev/null 2>&1"
+
+  if best_effort "kubectl get nodes >/dev/null 2>&1"; then
+    log "✅ kubectl can reach the cluster."
+  else
+    log "⚠️ kubectl cannot reach the cluster (it may already be deleted). Continuing anyway."
+  fi
+}
+
+########################################
+# Kubernetes cleanup (re-runnable)
+########################################
+delete_argocd_apps() {
+  if ! ns_exists "argocd"; then
+    log "ArgoCD namespace not found; skipping Argo applications deletion."
+    return 0
+  fi
+
+  local apps
+  apps="$(kubectl -n argocd get applications -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)"
+
+  if [[ -z "${apps// /}" ]]; then
+    log "No ArgoCD applications found; skipping."
+    return 0
+  fi
+
+  log "Deleting ArgoCD Applications (re-runnable)."
+  while IFS= read -r app; do
+    [[ -z "$app" ]] && continue
+    log " - Deleting application: $app"
+    best_effort "kubectl -n argocd delete application \"$app\" --ignore-not-found"
+  done <<< "$apps"
+}
+
+delete_ingresses_and_lb_services() {
+  log "Deleting all Ingress objects..."
+  best_effort "kubectl delete ingress --all -A --ignore-not-found=true"
+
+  log "Deleting all Services of type LoadBalancer..."
+  local namespaces
+  namespaces="$(kubectl get ns -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)"
+  while IFS= read -r ns; do
+    [[ -z "$ns" ]] && continue
+    best_effort "kubectl -n \"$ns\" delete svc --field-selector spec.type=LoadBalancer --ignore-not-found=true"
+  done <<< "$namespaces"
+}
+
+delete_lbc_crd_instances() {
+  log "Deleting AWS Load Balancer Controller CRD instances (if present)..."
+  best_effort "kubectl delete targetgroupbinding --all -A --ignore-not-found=true"
+  best_effort "kubectl delete ingressclassparams --all --ignore-not-found=true"
+}
+
+uninstall_lbc_helm() {
+  if [[ "$CLEAN_HELM_LBC" != "true" ]]; then
+    log "Skipping Helm uninstall of aws-load-balancer-controller (CLEAN_HELM_LBC=false)."
+    return 0
+  fi
+
+  if ! have_cmd helm; then
+    log "helm not found; skipping Helm uninstall."
+    return 0
+  fi
+
+  log "Uninstalling aws-load-balancer-controller Helm release (best-effort)..."
+  best_effort "helm uninstall aws-load-balancer-controller -n kube-system 2>/dev/null || true"
+}
+
+delete_lbc_crds() {
+  if [[ "$DELETE_LBC_CRDS" != "true" ]]; then
+    log "Skipping deletion of LBC CRDs (DELETE_LBC_CRDS=false)."
+    return 0
+  fi
+
+  log "Deleting AWS Load Balancer Controller CRDs (best-effort)..."
+  best_effort "kubectl delete crd ingressclassparams.elbv2.k8s.aws --ignore-not-found=true"
+  best_effort "kubectl delete crd targetgroupbindings.elbv2.k8s.aws --ignore-not-found=true"
+}
+
+########################################
+# AWS cleanup (optional, guarded)
+########################################
+wait_for_elbv2_lbs_to_clear() {
+  log "Waiting for ELBv2 load balancers to disappear (best-effort)..."
+  wait_for_condition "$WAIT_LB_TIMEOUT_SECS" "$WAIT_POLL_SECS" "ELBv2 load balancer count == 0" \
+    "[ \"$(aws elbv2 describe-load-balancers --region \"$REGION\" --query 'length(LoadBalancers[])' --output text 2>/dev/null || echo 0)\" = \"0\" ]" \
+    || return 1
+}
+
+delete_all_elbv2_lbs_in_region() {
+  [[ "$CLEAN_AWS_LBS" != "true" ]] && return 0
+
+  log "CLEAN_AWS_LBS=true → deleting ALL ELBv2 load balancers in region $REGION (best-effort)."
+  local lbs
+  lbs="$(aws elbv2 describe-load-balancers --region "$REGION" --query "LoadBalancers[].LoadBalancerArn" --output text 2>/dev/null || true)"
+  for lb in $lbs; do
+    log " - Deleting LB: $lb"
+    best_effort "aws elbv2 delete-load-balancer --region \"$REGION\" --load-balancer-arn \"$lb\""
   done
-else
-  echo "  - Cluster not found, skipping."
-fi
+}
 
-##########################################
-# 3. Delete KMS alias & CW log group     #
-##########################################
-echo "==> Deleting KMS alias for EKS (if exists)..."
-if aws kms list-aliases --query "Aliases[?AliasName=='alias/eks/${CLUSTER_NAME}']" --output text 2>/dev/null | grep -q "alias/eks/${CLUSTER_NAME}"; then
-  aws kms delete-alias --alias-name "alias/eks/${CLUSTER_NAME}" || true
-  echo "  - Deleted KMS alias alias/eks/${CLUSTER_NAME}"
-else
-  echo "  - No KMS alias found for alias/eks/${CLUSTER_NAME}"
-fi
+delete_all_target_groups_in_region() {
+  [[ "$CLEAN_AWS_TGS" != "true" ]] && return 0
 
-echo "==> Deleting CloudWatch log group for EKS cluster (if exists)..."
-aws logs delete-log-group --log-group-name "/aws/eks/${CLUSTER_NAME}/cluster" 2>/dev/null || echo "  - No log group to delete."
-
-#################################
-# 4. Delete IAM roles & policies#
-#################################
-echo "==> Deleting IAM roles related to ${CLUSTER_NAME}/${PROJECT_TAG}..."
-ROLE_NAMES=$(aws iam list-roles --query "Roles[?contains(RoleName, '${CLUSTER_NAME}') || contains(RoleName, 'alb-controller') || contains(RoleName, 'eks-node-group')].RoleName" --output text 2>/dev/null || true)
-for role in ${ROLE_NAMES}; do
-  echo "  - Processing role: ${role}"
-  ARNS=$(aws iam list-attached-role-policies --role-name "${role}" --query "AttachedPolicies[].PolicyArn" --output text 2>/dev/null || true)
-  for arn in ${ARNS}; do
-    echo "    * Detaching policy ${arn}"
-    aws iam detach-role-policy --role-name "${role}" --policy-arn "${arn}" || true
+  log "CLEAN_AWS_TGS=true → deleting ALL target groups in region $REGION (best-effort)."
+  local tgs
+  tgs="$(aws elbv2 describe-target-groups --region "$REGION" --query "TargetGroups[].TargetGroupArn" --output text 2>/dev/null || true)"
+  for tg in $tgs; do
+    log " - Deleting target group: $tg"
+    best_effort "aws elbv2 delete-target-group --region \"$REGION\" --target-group-arn \"$tg\""
   done
+}
 
-  INLINES=$(aws iam list-role-policies --role-name "${role}" --query "PolicyNames[]" --output text 2>/dev/null || true)
-  for pol in ${INLINES}; do
-    echo "    * Deleting inline policy ${pol}"
-    aws iam delete-role-policy --role-name "${role}" --policy-name "${pol}" || true
+delete_available_ebs_volumes() {
+  [[ "$CLEAN_EBS_AVAILABLE" != "true" ]] && return 0
+
+  log "CLEAN_EBS_AVAILABLE=true → deleting AVAILABLE EBS volumes in region $REGION (best-effort)."
+  local vols
+  vols="$(aws ec2 describe-volumes --region "$REGION" --filters Name=status,Values=available --query "Volumes[].VolumeId" --output text 2>/dev/null || true)"
+  for vol in $vols; do
+    log " - Deleting EBS volume: $vol"
+    best_effort "aws ec2 delete-volume --region \"$REGION\" --volume-id \"$vol\""
   done
+}
 
-  echo "    * Deleting role ${role}"
-  aws iam delete-role --role-name "${role}" || true
-done
+########################################
+# OIDC cleanup (safe-mode)
+########################################
+oidc_cleanup_unused() {
+  [[ "$CLEAN_OIDC_UNUSED" != "true" ]] && return 0
 
-echo "==> Deleting standalone IAM policies related to ${CLUSTER_NAME}..."
-POLICY_ARNS=$(aws iam list-policies --scope Local --query "Policies[?contains(PolicyName, '${CLUSTER_NAME}') || contains(PolicyName, 'alb-controller')].Arn" --output text 2>/dev/null || true)
-for parn in ${POLICY_ARNS}; do
-  echo "  - Deleting policy ${parn}"
-  aws iam delete-policy --policy-arn "${parn}" || true
-done
+  log "OIDC cleanup (safe mode): delete ONLY providers not referenced by any IAM role trust policy."
+  local oidcs
+  oidcs="$(aws iam list-open-id-connect-providers --query "OpenIDConnectProviderList[].Arn" --output text 2>/dev/null || true)"
+  if [[ -z "${oidcs// /}" ]]; then
+    log "No OIDC providers found."
+    return 0
+  fi
 
-###########################
-# 5. Delete tagged VPC(s) #
-###########################
-echo "==> Deleting VPCs tagged Project=${PROJECT_TAG}, Environment=${ENV_TAG}..."
-VPCS=$(aws ec2 describe-vpcs \
-   --filters "Name=tag:Project,Values=${PROJECT_TAG}" "Name=tag:Environment,Values=${ENV_TAG}" \
-   --query "Vpcs[].VpcId" --output text 2>/dev/null || true)
+  for oidc_arn in $oidcs; do
+    log "Checking OIDC provider: $oidc_arn"
 
-for v in ${VPCS}; do
-  delete_vpc_safely "${v}"
-done
+    # Find roles that reference this provider in their AssumeRolePolicyDocument.
+    # Note: list-roles returns AssumeRolePolicyDocument only in some environments; best-effort.
+    local matching_roles
+    matching_roles="$(aws iam list-roles \
+      --query "Roles[?contains(to_string(AssumeRolePolicyDocument), '$oidc_arn')].RoleName" \
+      --output text 2>/dev/null || true)"
 
-#################################
-# 6. Delete Terraform state     #
-#################################
-echo "==> Cleaning Terraform local state..."
-rm -f terraform.tfstate terraform.tfstate.backup || true
-rm -rf .terraform .terraform.lock.hcl || true
+    if [[ -n "${matching_roles// /}" ]]; then
+      log "⚠️ Still referenced by IAM roles; skipping deletion:"
+      echo "$matching_roles"
+      continue
+    fi
 
-echo "==> Cleaning remote Terraform state (if configured)..."
-if aws s3 ls "s3://${TFSTATE_BUCKET}/${TFSTATE_KEY_PREFIX}/terraform.tfstate" >/dev/null 2>&1; then
-  echo "  - Deleting S3 state object"
-  aws s3 rm "s3://${TFSTATE_BUCKET}/${TFSTATE_KEY_PREFIX}/terraform.tfstate" || true
-else
-  echo "  - No S3 state object found at s3://${TFSTATE_BUCKET}/${TFSTATE_KEY_PREFIX}/terraform.tfstate"
-fi
+    log "🗑 Deleting unused OIDC provider: $oidc_arn"
+    best_effort "aws iam delete-open-id-connect-provider --open-id-connect-provider-arn \"$oidc_arn\""
+  done
+}
 
-if aws dynamodb describe-table --table-name "${TF_LOCK_TABLE}" >/dev/null 2>&1; then
-  echo "  - Deleting DynamoDB lock table ${TF_LOCK_TABLE}"
-  aws dynamodb delete-table --table-name "${TF_LOCK_TABLE}" || true
+########################################
+# Terraform destroys
+########################################
+destroy_tf_dir() {
+  local dir="$1"
+  if [[ ! -d "$dir" ]]; then
+    log "Terraform directory not found: $dir (skipping)"
+    return 0
+  fi
 
-else
-  echo "  - No DynamoDB lock table ${TF_LOCK_TABLE} found."
-fi
+  log "Terraform destroy: $dir"
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "DRY_RUN> (cd \"$dir\" && terraform destroy -auto-approve)"
+    return 0
+  fi
 
-  aws dynamodb create-table \
-  --table-name hartree-tfstate-locks \
-  --attribute-definitions AttributeName=LockID,AttributeType=S \
-  --key-schema AttributeName=LockID,KeyType=HASH \
-  --billing-mode PAY_PER_REQUEST
-echo "============================================"
-echo "==> ALL DONE. EKS/VPC/IAM/state for ${CLUSTER_NAME} cleaned (best-effort)."
-echo "============================================"
+  ( cd "$dir" && terraform destroy -auto-approve ) || {
+    log "⚠️ terraform destroy failed in $dir (you can re-run this script safely)."
+    return 1
+  }
+}
+
+########################################
+# Main
+########################################
+main() {
+  need_cmds aws kubectl terraform
+  [[ "$CLEAN_HELM_LBC" == "true" ]] && need_cmds helm || true
+  need_cmds jq || true # optional (not required)
+
+  log "============================================================"
+  log " Hartree merged destroy/cleanup (re-runnable)"
+  log " Cluster: $CLUSTER_NAME"
+  log " Region : $REGION"
+  log " GitOps : $TF_GITOPS_DIR"
+  log " Infra  : $TF_INFRA_DIR"
+  log " DryRun : $DRY_RUN"
+  log "============================================================"
+
+  ensure_kubeconfig
+
+  # 1) Apps first (Argo)
+  delete_argocd_apps
+
+  # 2) K8s pre-clean that triggers AWS deletions
+  delete_ingresses_and_lb_services
+  delete_lbc_crd_instances
+
+  # Optional: uninstall LBC and remove CRDs (generally safe before cluster delete)
+  uninstall_lbc_helm
+  delete_lbc_crds
+
+  log "Sleeping 20s to allow controllers to begin cleanup..."
+  [[ "$DRY_RUN" == "true" ]] || sleep 20
+
+  # Optional deeper AWS cleanup (off by default)
+  delete_all_elbv2_lbs_in_region
+  delete_all_target_groups_in_region
+  delete_available_ebs_volumes
+
+  # Best-effort wait for LBs to clear (helpful if you run with CLEAN_AWS_LBS=false too)
+  best_effort "aws elbv2 describe-load-balancers --region \"$REGION\" >/dev/null 2>&1" && \
+    wait_for_elbv2_lbs_to_clear || true
+
+  # 3) Destroy TF layers (gitops → infra)
+  destroy_tf_dir "$TF_GITOPS_DIR" || true
+  destroy_tf_dir "$TF_INFRA_DIR" || true
+
+  # 4) OIDC safe cleanup (optional, safe-mode)
+  oidc_cleanup_unused || true
+
+  log "============================================================"
+  log " Done."
+  log " Re-run safe. If something fails, fix the underlying issue and re-run."
+  log "============================================================"
+}
+
+main "$@"
